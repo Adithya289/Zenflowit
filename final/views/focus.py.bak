@@ -1,0 +1,1069 @@
+import streamlit as st
+import time
+import datetime
+from streamlit_extras.stylable_container import stylable_container
+from utils.db import (
+    get_focus_stats, update_focus_stats, reset_focus_stats, get_tasks,
+    get_task_id_by_name, update_task_focus_stats, get_task_focus_stats,
+    get_timer_settings, update_timer_settings, get_focus_stats_by_list,
+    get_unlinked_focus_stats, get_task_focus_stats_for_user, get_task_by_id
+)
+from utils.theme import apply_theme_aware_styles, get_theme_colors, get_component_styles
+
+def format_time(seconds):
+    """Format seconds into MM:SS display format"""
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+def show_focus():
+    """Display the modernized Focus page with Pomodoro timer"""
+    # Apply theme-aware styling
+    is_dark_theme = apply_theme_aware_styles()
+    colors = get_theme_colors()
+    styles = get_component_styles()  # Get reusable component styles
+    
+    # Initialize session state variables if they don't exist
+    if 'timer_mode' not in st.session_state:
+        st.session_state.timer_mode = 'pomodoro'  # 'pomodoro', 'short_break', or 'long_break'
+    
+    # Load timer settings from database if user is logged in
+    if ('timer_settings_loaded' not in st.session_state) and hasattr(st.session_state, 'user_id') and st.session_state.user_id:
+        # Get timer settings from database
+        timer_settings = get_timer_settings(st.session_state.user_id)
+        
+        # Update session state with settings from the database
+        st.session_state.pomodoro_duration = timer_settings["pomodoro_duration"]
+        st.session_state.short_break_duration = timer_settings["short_break_duration"]
+        st.session_state.long_break_duration = timer_settings["long_break_duration"]
+        
+        # Mark as loaded to avoid reloading on every rerun
+        st.session_state.timer_settings_loaded = True
+    else:
+        # Set defaults if not loaded from database or no user is logged in
+        if 'pomodoro_duration' not in st.session_state:
+            st.session_state.pomodoro_duration = 25  # minutes
+            
+        if 'short_break_duration' not in st.session_state:
+            st.session_state.short_break_duration = 5  # minutes
+            
+        if 'long_break_duration' not in st.session_state:
+            st.session_state.long_break_duration = 15  # minutes
+    
+    if 'timer_running' not in st.session_state:
+        st.session_state.timer_running = False
+        
+    if 'timer_paused' not in st.session_state:
+        st.session_state.timer_paused = False
+    
+    if 'time_remaining' not in st.session_state:
+        st.session_state.time_remaining = st.session_state.pomodoro_duration * 60  # seconds
+    
+    if 'last_update_time' not in st.session_state:
+        st.session_state.last_update_time = None
+        
+    if 'target_end_time' not in st.session_state:
+        st.session_state.target_end_time = None
+    
+    if 'linked_task' not in st.session_state:
+        st.session_state.linked_task = None
+        
+    if 'linked_task_id' not in st.session_state:
+        st.session_state.linked_task_id = None
+    
+    if 'total_focus_time' not in st.session_state:
+        st.session_state.total_focus_time = 0
+    
+    if 'sessions_completed' not in st.session_state:
+        st.session_state.sessions_completed = 0
+    
+    # Add new session state variables for break tracking
+    if 'total_break_time' not in st.session_state:
+        st.session_state.total_break_time = 0
+    
+    if 'breaks_completed' not in st.session_state:
+        st.session_state.breaks_completed = 0
+    
+    # Load persistent stats from file for the logged-in user
+    if ('stats_loaded' not in st.session_state):
+        if hasattr(st.session_state, 'user_id') and st.session_state.user_id:
+            saved_stats = get_focus_stats(st.session_state.user_id)
+            st.session_state.total_focus_time = saved_stats["total_focus_time"]
+            st.session_state.sessions_completed = saved_stats["pomodoros_completed"]
+            st.session_state.stats_loaded = True
+        else:
+            # Set defaults if no user is logged in
+            st.session_state.total_focus_time = 0
+            st.session_state.sessions_completed = 0
+    
+    # Initialize session state for tracking changes
+    if 'settings_changed' not in st.session_state:
+        st.session_state.settings_changed = False
+    
+    # Check if we should auto-start a Pomodoro session from the tasks page
+    if st.session_state.get('start_pomodoro', False):
+        # Set the timer mode to pomodoro
+        st.session_state.timer_mode = 'pomodoro'
+        
+        # Set the time remaining to the pomodoro duration
+        st.session_state.time_remaining = st.session_state.pomodoro_duration * 60
+        
+        # Set the linked task
+        if 'focus_task_name' in st.session_state:
+            st.session_state.linked_task = st.session_state.focus_task_name
+            
+        # Store the task ID directly if available
+        if 'focus_task_id' in st.session_state:
+            st.session_state.linked_task_id = st.session_state.focus_task_id
+        else:
+            # If no task ID provided, try to find it
+            st.session_state.linked_task_id = None
+        
+        # Start the timer
+        current_time = time.time()
+        st.session_state.timer_running = True
+        st.session_state.timer_paused = False
+        st.session_state.last_update_time = current_time
+        st.session_state.target_end_time = current_time + st.session_state.time_remaining
+        
+        # Clear the flags to prevent auto-starting on page refresh
+        st.session_state.start_pomodoro = False
+    
+    # Function to set the timer mode
+    def set_timer_mode(mode):
+        if st.session_state.timer_running and not st.session_state.timer_paused:
+            # If timer is running, just store the mode for next time
+            st.session_state.next_timer_mode = mode
+            return
+        
+        st.session_state.timer_mode = mode
+        # Set the appropriate duration based on the mode
+        if mode == 'pomodoro':
+            st.session_state.time_remaining = st.session_state.pomodoro_duration * 60
+        elif mode == 'short_break':
+            st.session_state.time_remaining = st.session_state.short_break_duration * 60
+        else:  # 'long_break'
+            st.session_state.time_remaining = st.session_state.long_break_duration * 60
+        st.session_state.timer_running = False
+        st.session_state.timer_paused = False
+        st.session_state.target_end_time = None
+    
+    # Function to update timer when slider values change
+    def update_pomodoro_time():
+        if not st.session_state.timer_running and st.session_state.timer_mode == 'pomodoro':
+            # We'll now only track that something changed, not update the timer yet
+            st.session_state.settings_changed = True
+            
+    def update_short_break_time():
+        if not st.session_state.timer_running and st.session_state.timer_mode == 'short_break':
+            # We'll now only track that something changed, not update the timer yet
+            st.session_state.settings_changed = True
+            
+    def update_long_break_time():
+        if not st.session_state.timer_running and st.session_state.timer_mode == 'long_break':
+            # We'll now only track that something changed, not update the timer yet
+            st.session_state.settings_changed = True
+    
+    # Page layout - changed to full width since settings moved to sidebar
+    st.markdown(f"""
+    <style>
+    .main-focus-container {{
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        max-width: 800px;
+        margin: 0 auto;
+    }}
+    </style>
+    """, unsafe_allow_html=True)
+    
+    # Main container div
+    st.markdown('<div class="main-focus-container">', unsafe_allow_html=True)
+    
+    # Create a clean container for the timer
+    with stylable_container(
+        key="timer_container",
+        css_styles=styles["timer_container"],
+    ):
+        # 1. Mode Selector
+        st.markdown("""
+        <style>
+        .mode-selector {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .mode-button {
+            padding: 8px 16px;
+            border-radius: 30px;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 14px;
+            transition: all 0.2s ease;
+            text-align: center;
+            min-width: 120px;
+        }
+        .mode-button.active {
+            color: white;
+            transform: scale(1.05);
+        }
+        .mode-button:hover {
+            transform: translateY(-2px);
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Instead of HTML buttons + hidden Streamlit buttons, use direct Streamlit buttons with styling
+        cols = st.columns(3)
+        with cols[0]:
+            pomodoro_style = f"background-color: {colors['primary_color']}; color: white;" if st.session_state.timer_mode == "pomodoro" else f"background-color: white; color: {colors['text_color']}; border: 1px solid {colors['border_color']};"
+            pomodoro_btn = st.button("Pomodoro", key="pomodoro_btn", use_container_width=True)
+            if pomodoro_btn:
+                set_timer_mode('pomodoro')
+                st.rerun()
+            # Apply custom styling to the button
+            st.markdown(f"""
+            <style>
+                div[data-testid="stButton"]:nth-of-type(1) button {{
+                    {pomodoro_style}
+                    border-radius: 30px;
+                    font-weight: 500;
+                }}
+            </style>
+            """, unsafe_allow_html=True)
+            
+        with cols[1]:
+            short_break_style = f"background-color: {colors['primary_color']}; color: white;" if st.session_state.timer_mode == "short_break" else f"background-color: white; color: {colors['text_color']}; border: 1px solid {colors['border_color']};"
+            short_break_btn = st.button("Short Break", key="short_break_btn", use_container_width=True)
+            if short_break_btn:
+                set_timer_mode('short_break')
+                st.rerun()
+            # Apply custom styling to the button
+            st.markdown(f"""
+            <style>
+                div[data-testid="stButton"]:nth-of-type(2) button {{
+                    {short_break_style}
+                    border-radius: 30px;
+                    font-weight: 500;
+                }}
+            </style>
+            """, unsafe_allow_html=True)
+            
+        with cols[2]:
+            long_break_style = f"background-color: {colors['primary_color']}; color: white;" if st.session_state.timer_mode == "long_break" else f"background-color: white; color: {colors['text_color']}; border: 1px solid {colors['border_color']};"
+            long_break_btn = st.button("Long Break", key="long_break_btn", use_container_width=True)
+            if long_break_btn:
+                set_timer_mode('long_break')
+                st.rerun()
+            # Apply custom styling to the button
+            st.markdown(f"""
+            <style>
+                div[data-testid="stButton"]:nth-of-type(3) button {{
+                    {long_break_style}
+                    border-radius: 30px;
+                    font-weight: 500;
+                }}
+            </style>
+            """, unsafe_allow_html=True)
+        
+        # 2. Task Display - Show currently linked task
+        if st.session_state.linked_task:
+            task_cols = st.columns([5, 1])
+            with task_cols[0]:
+                # Get task details if user is logged in
+                task_details = None
+                if hasattr(st.session_state, 'user_id') and st.session_state.user_id and st.session_state.linked_task_id:
+                    task_details = get_task_by_id(st.session_state.linked_task_id, st.session_state.user_id)
+                    focus_stats = get_task_focus_stats(st.session_state.linked_task_id, st.session_state.user_id)
+                
+                # Create the task card with basic info
+                task_card = f"""
+                <div style="margin: 10px 0; padding: 12px 16px; background-color: {colors['light_accent']}40; 
+                border-radius: 8px; text-align: left; border-left: 4px solid {colors['primary_color']};">
+                <strong style="font-size: 16px; color: {colors['primary_color']};">{st.session_state.linked_task}</strong>
+                """
+                
+                # Add deadline if available
+                if task_details and task_details.get('deadline'):
+                    from datetime import datetime
+                    deadline = datetime.strptime(task_details['deadline'], '%Y-%m-%d').date()
+                    today = datetime.now().date()
+                    days_left = (deadline - today).days
+                    
+                    if days_left < 0:
+                        deadline_text = f"<span style='color: #ff4b4b;'>Overdue by {abs(days_left)} days</span>"
+                    elif days_left == 0:
+                        deadline_text = "<span style='color: #ff9f1c;'>Due today</span>"
+                    elif days_left == 1:
+                        deadline_text = "<span style='color: #ff9f1c;'>Due tomorrow</span>"
+                    elif days_left <= 3:
+                        deadline_text = f"<span style='color: #ff9f1c;'>Due in {days_left} days</span>"
+                    else:
+                        deadline_text = f"<span style='color: {colors['text_color']}80;'>Due in {days_left} days</span>"
+                    
+                    task_card += f"<div style='margin-top: 6px;'>⏰ {deadline_text}</div>"
+                
+                # Add focus time if available
+                if focus_stats:
+                    focus_minutes = focus_stats.get('focus_time_seconds', 0) // 60
+                    focus_hours = focus_minutes // 60
+                    focus_remaining_minutes = focus_minutes % 60
+                    
+                    if focus_hours > 0:
+                        focus_text = f"{focus_hours}h {focus_remaining_minutes}m"
+                    else:
+                        focus_text = f"{focus_minutes}m"
+                    
+                    sessions = focus_stats.get('sessions_completed', 0)
+                    task_card += f"<div style='margin-top: 4px;'>⏱️ <span style='color: {colors['text_color']}80;'>{focus_text} focused | {sessions} session{'s' if sessions != 1 else ''}</span></div>"
+                
+                # Close the card div
+                task_card += "</div>"
+                
+                # Display the card
+                st.markdown(task_card, unsafe_allow_html=True)
+                
+                # Add expandable content with subtasks and action plans
+                if task_details:
+                    with st.expander("View Details", expanded=False):
+                        if task_details.get('subtasks'):
+                            st.markdown(f"<strong style='color: {colors['primary_color']};'>Subtasks:</strong>", unsafe_allow_html=True)
+                            for i, subtask in enumerate(task_details['subtasks']):
+                                st.markdown(f"- {subtask}", unsafe_allow_html=True)
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            
+                        if task_details.get('action_plan'):
+                            st.markdown(f"<strong style='color: {colors['primary_color']};'>Action Plan:</strong>", unsafe_allow_html=True)
+                            for i, step in enumerate(task_details['action_plan']):
+                                st.markdown(f"{i+1}. {step}", unsafe_allow_html=True)
+            
+            with task_cols[1]:
+                if st.button("❌", key="unlink_task", help="Remove linked task"):
+                    st.session_state.linked_task = None
+                    st.session_state.linked_task_id = None
+                    st.rerun()
+        
+        # 3. Timer Display
+        st.markdown("""
+        <style>
+        .timer-display {
+            font-size: 8rem;
+            font-weight: 700;
+            font-family: 'Roboto Mono', monospace;
+            margin: 30px 0;
+            padding: 20px;
+    text-align: center;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        # Calculate progress
+        if st.session_state.timer_mode == 'pomodoro':
+            # Use the session state's slider value for progress calculation
+            if 'pomodoro_slider' in st.session_state:
+                total_secs = st.session_state.pomodoro_slider * 60
+            else:
+                total_secs = st.session_state.pomodoro_duration * 60
+        elif st.session_state.timer_mode == 'short_break':
+            if 'short_break_slider' in st.session_state:
+                total_secs = st.session_state.short_break_slider * 60
+            else:
+                total_secs = st.session_state.short_break_duration * 60
+        else:  # long_break
+            if 'long_break_slider' in st.session_state:
+                total_secs = st.session_state.long_break_slider * 60
+            else:
+                total_secs = st.session_state.long_break_duration * 60
+        
+        # Ensure time_remaining never exceeds total_secs to avoid negative progress values
+        elapsed_seconds = max(0, total_secs - st.session_state.time_remaining)
+        progress_percentage = min(1.0, max(0.0, elapsed_seconds / total_secs if total_secs > 0 else 0))
+        
+        # Progress bar
+        st.progress(progress_percentage)
+        
+        # Display the timer
+        minutes, seconds = divmod(st.session_state.time_remaining, 60)
+        st.markdown(f"""
+        <div class="timer-display">
+            {minutes:02d}:{seconds:02d}
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # 4. Control Buttons
+        st.markdown("""
+        <style>
+        /* Center all buttons in the timer container */
+        .main-controls-container {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin: 20px auto;
+        }
+        
+        /* Style for all control buttons */
+        .control-button button {
+            width: 60px !important;
+            height: 60px !important;
+            border-radius: 50% !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            font-size: 24px !important;
+            padding: 0 !important;
+            margin: 0 auto !important;
+        }
+        
+        /* Fix the issue with the column divs */
+        [data-testid="column"] {
+            display: flex !important;
+            justify-content: center !important;
+            align-items: center !important;
+        }
+        
+        /* Transition prompt styling */
+        .transition-prompt {
+            background-color: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }
+        .transition-prompt h3 {
+            margin-bottom: 15px;
+        }
+        .action-button {
+            margin: 0 10px;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("<div class='main-controls-container'>", unsafe_allow_html=True)
+        
+        # Create control buttons directly using Streamlit - only if not in transition mode
+        if not ("awaiting_user_action" in st.session_state and st.session_state.awaiting_user_action):
+            # Create a single row for all buttons
+            cols = st.columns([1, 1, 1])
+            
+            # Start button
+            with cols[0]:
+                start_disabled = st.session_state.timer_running and not st.session_state.timer_paused
+                if st.button("▶️", key="start_btn", disabled=start_disabled):
+                    current_time = time.time()
+                    st.session_state.timer_running = True
+                    st.session_state.timer_paused = False
+                    st.session_state.last_update_time = current_time
+                    st.session_state.target_end_time = current_time + st.session_state.time_remaining
+                    st.rerun()
+                
+                # Apply custom styling to the button
+                st.markdown(f"""
+                <style>
+                    div[data-testid="stButton"]:nth-of-type(4) button {{
+                        {styles["control_button"]}
+                    }}
+                </style>
+                """, unsafe_allow_html=True)
+            
+            # Pause button
+            with cols[1]:
+                pause_icon = "▶️" if st.session_state.timer_paused else "⏸️"
+                pause_disabled = not st.session_state.timer_running
+                if st.button(pause_icon, key="pause_btn", disabled=pause_disabled):
+                    if st.session_state.timer_running:
+                        st.session_state.timer_paused = not st.session_state.timer_paused
+                        current_time = time.time()
+                        
+                        if st.session_state.timer_paused:
+                            # When pausing, store the pause time
+                            st.session_state.pause_time = current_time
+                        else:
+                            # When resuming, adjust the target end time
+                            if hasattr(st.session_state, 'pause_time'):
+                                pause_duration = current_time - st.session_state.pause_time
+                                if st.session_state.target_end_time is not None:
+                                    st.session_state.target_end_time += pause_duration
+                        
+                        # Set the last update time to now
+                        st.session_state.last_update_time = current_time
+                    st.rerun()
+                
+                # Apply custom styling to the button
+                st.markdown(f"""
+                <style>
+                    div[data-testid="stButton"]:nth-of-type(5) button {{
+                        {styles["pause_button"]}
+                    }}
+                </style>
+                """, unsafe_allow_html=True)
+            
+            # Reset button
+            with cols[2]:
+                if st.button("🔄", key="reset_btn"):
+                    # If a completed session, log it before resetting
+                    if st.session_state.timer_running and st.session_state.timer_mode == 'pomodoro':
+                        elapsed_seconds = st.session_state.pomodoro_duration * 60 - st.session_state.time_remaining
+                        if elapsed_seconds > 0:
+                            # Log the partial session
+                            st.session_state.total_focus_time += elapsed_seconds
+                    
+                    # Reset timer
+                    set_timer_mode(st.session_state.timer_mode)  # This resets the time based on current mode
+                    st.rerun()
+                
+                # Apply custom styling to the button
+                st.markdown(f"""
+                <style>
+                    div[data-testid="stButton"]:nth-of-type(6) button {{
+                        {styles["reset_button"]}
+                    }}
+                </style>
+                """, unsafe_allow_html=True)
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    # MOVED: Show transition prompt outside the main timer container
+    if "awaiting_user_action" in st.session_state and st.session_state.awaiting_user_action:
+        with stylable_container(
+            key="transition_container",
+            css_styles=styles["transition_container"],
+        ):
+            if st.session_state.completed_mode == "pomodoro":
+                st.markdown(f"<h3 style='color: #00BFFF;'>🎉 Pomodoro Complete!</h3>", unsafe_allow_html=True)
+                st.markdown(f"<p style='color: #00BFFF;'>Take a short break to recharge before your next focused session.</p>", unsafe_allow_html=True)
+                
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("⏱️ Start Short Break", key="start_short_break", use_container_width=True):
+                        # Reset awaiting action
+                        st.session_state.awaiting_user_action = False
+                        # Change mode to short break
+                        set_timer_mode("short_break")
+                        # Auto-start timer
+                        current_time = time.time()
+                        st.session_state.timer_running = True
+                        st.session_state.timer_paused = False
+                        st.session_state.last_update_time = current_time
+                        st.session_state.target_end_time = current_time + st.session_state.time_remaining
+                        st.rerun()
+                
+                with col2:
+                    if st.button("🧠 Start Long Break", key="start_long_break", use_container_width=True):
+                        # Reset awaiting action
+                        st.session_state.awaiting_user_action = False
+                        # Change mode to long break
+                        set_timer_mode("long_break")
+                        # Auto-start timer
+                        current_time = time.time()
+                        st.session_state.timer_running = True
+                        st.session_state.timer_paused = False
+                        st.session_state.last_update_time = current_time
+                        st.session_state.target_end_time = current_time + st.session_state.time_remaining
+                        st.rerun()
+                    
+            else:  # Break completed
+                st.markdown(f"<h3 style='color: #00BFFF;'>⏱️ Break Completed!</h3>", unsafe_allow_html=True)
+                st.markdown(f"<p style='color: #00BFFF;'>Ready for another focused Pomodoro session?</p>", unsafe_allow_html=True)
+                
+                if st.button("🚀 Start Next Pomodoro", key="start_next_pomodoro", use_container_width=True):
+                    # Reset awaiting action
+                    st.session_state.awaiting_user_action = False
+                    # Change mode to pomodoro
+                    set_timer_mode("pomodoro")
+                    # Auto-start timer
+                    current_time = time.time()
+                    st.session_state.timer_running = True
+                    st.session_state.timer_paused = False
+                    st.session_state.last_update_time = current_time
+                    st.session_state.target_end_time = current_time + st.session_state.time_remaining
+                    st.rerun()
+    
+    # Stats Cards
+    total_minutes = st.session_state.total_focus_time // 60
+    total_hours = total_minutes // 60
+    remaining_minutes = total_minutes % 60
+    time_display = f"{total_hours}h {remaining_minutes}m" if total_hours > 0 else f"{total_minutes}m"
+    
+    # Calculate break time in a readable format
+    break_minutes = st.session_state.total_break_time // 60
+    break_hours = break_minutes // 60
+    break_remaining_minutes = break_minutes % 60
+    break_time_display = f"{break_hours}h {break_remaining_minutes}m" if break_hours > 0 else f"{break_minutes}m"
+    
+    # Create a header for the statistics section
+    st.markdown(f"""
+    <h3 style="color: #00BFFF; font-size: 1.9rem; font-weight: 700; margin: 1.5rem 0; padding: 0.5rem; text-align: center;">
+    📊 Your Statistics
+    </h3>
+    """, unsafe_allow_html=True)
+    
+    # Create columns for the statistics cards
+    stats_cols = st.columns(4)
+    
+    with stats_cols[0]:
+        # Use a custom div with inline styles for the first card
+        st.markdown(f"""
+        <div style="text-align: center; padding: 20px; border: 6px solid {colors['primary_color']}; border-radius: 10px; background-color: {colors['is_dark_theme'] and '#0e1525' or '#0a2a5e'}; box-shadow: 0 8px 16px rgba(0,0,0,0.15);">
+            <h3 style="font-size: 2.2rem; color: white; font-weight: 700;">{time_display}</h3>
+            <p style="margin-top: 5px; color: white; font-weight: 500;">Total Focus Time</p>
+            </div>
+        """, unsafe_allow_html=True)
+    
+    with stats_cols[1]:
+        # Use a custom div with inline styles for the second card
+        st.markdown(f"""
+        <div style="text-align: center; padding: 20px; border: 6px solid {colors['primary_color']}; border-radius: 10px; background-color: {colors['is_dark_theme'] and '#0e1525' or '#0a2a5e'}; box-shadow: 0 8px 16px rgba(0,0,0,0.15);">
+            <h3 style="font-size: 2.2rem; color: white; font-weight: 700;">{st.session_state.sessions_completed}</h3>
+            <p style="margin-top: 5px; color: white; font-weight: 500;">Sessions Completed</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with stats_cols[2]:
+        # Use a custom div with inline styles for the break time card
+        st.markdown(f"""
+        <div style="text-align: center; padding: 20px; border: 6px solid {colors['accent_color']}; border-radius: 10px; background-color: {colors['is_dark_theme'] and '#1e2a38' or '#153a78'}; box-shadow: 0 8px 16px rgba(0,0,0,0.15);">
+            <h3 style="font-size: 2.2rem; color: white; font-weight: 700;">{break_time_display}</h3>
+            <p style="margin-top: 5px; color: white; font-weight: 500;">Total Break Time</p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+    with stats_cols[3]:
+        # Use a custom div with inline styles for the breaks completed card
+        st.markdown(f"""
+        <div style="text-align: center; padding: 20px; border: 6px solid {colors['accent_color']}; border-radius: 10px; background-color: {colors['is_dark_theme'] and '#1e2a38' or '#153a78'}; box-shadow: 0 8px 16px rgba(0,0,0,0.15);">
+            <h3 style="font-size: 2.2rem; color: white; font-weight: 700;">{st.session_state.breaks_completed}</h3>
+            <p style="margin-top: 5px; color: white; font-weight: 500;">Breaks Completed</p>
+            </div>
+        """, unsafe_allow_html=True)
+    
+    # Advanced Analytics Section
+    if hasattr(st.session_state, 'user_id') and st.session_state.user_id:
+        with st.expander("🔍 Advanced Analytics", expanded=False):
+            analytics_tabs = st.tabs(["Lists & Categories", "Task Performance", "Unlinked Sessions"])
+            
+            with analytics_tabs[0]:
+                st.markdown(f"""
+                <h4 style="color: {colors['primary_color']}; font-size: 1.4rem; font-weight: 600; margin: 1rem 0;">
+                Focus Time by List
+                </h4>
+                """, unsafe_allow_html=True)
+                
+                # Get list-specific focus stats
+                list_stats = get_focus_stats_by_list(st.session_state.user_id)
+                
+                if list_stats:
+                    # Prepare data for chart
+                    list_names = [stat['list_name'] for stat in list_stats]
+                    list_focus_times = [stat['total_focus_time'] // 60 for stat in list_stats]  # Convert to minutes
+                    
+                    # Create a bar chart
+                    chart_data = {
+                        "List": list_names,
+                        "Minutes": list_focus_times
+                    }
+                    
+                    import pandas as pd
+                    chart_df = pd.DataFrame(chart_data)
+                    
+                    # Display the chart
+                    st.bar_chart(chart_df, x="List", y="Minutes")
+                    
+                    # Display data in a table
+                    st.markdown(f"""
+                    <h5 style="color: {colors['text_color']}; font-size: 1.1rem; font-weight: 600; margin: 1rem 0;">
+                    Detailed Focus Stats by List
+                    </h5>
+                    """, unsafe_allow_html=True)
+                    
+                    data_rows = []
+                    for stat in list_stats:
+                        focus_minutes = stat['total_focus_time'] // 60
+                        focus_hours = focus_minutes // 60
+                        focus_remaining_minutes = focus_minutes % 60
+                        formatted_time = f"{focus_hours}h {focus_remaining_minutes}m" if focus_hours > 0 else f"{focus_minutes}m"
+                        
+                        data_rows.append({
+                            "List": stat['list_name'],
+                            "Total Focus Time": formatted_time,
+                            "Sessions": stat['total_sessions']
+                        })
+                    
+                    st.dataframe(data_rows, use_container_width=True)
+                else:
+                    st.info("No focus data by list available yet. Complete some focused sessions with tasks to see analytics.")
+            
+            with analytics_tabs[1]:
+                st.markdown(f"""
+                <h4 style="color: {colors['primary_color']}; font-size: 1.4rem; font-weight: 600; margin: 1rem 0;">
+                Top Tasks by Focus Time
+                </h4>
+                """, unsafe_allow_html=True)
+                
+                # Get task-specific focus stats
+                task_stats = get_task_focus_stats_for_user(st.session_state.user_id)
+                
+                if task_stats:
+                    # Prepare data for display
+                    data_rows = []
+                    for stat in task_stats:
+                        focus_minutes = stat['focus_time_seconds'] // 60
+                        focus_hours = focus_minutes // 60
+                        focus_remaining_minutes = focus_minutes % 60
+                        formatted_time = f"{focus_hours}h {focus_remaining_minutes}m" if focus_hours > 0 else f"{focus_minutes}m"
+                        
+                        data_rows.append({
+                            "Task": stat['task_name'],
+                            "List": stat['list_name'],
+                            "Focus Time": formatted_time,
+                            "Sessions": stat['sessions_completed']
+                        })
+                    
+                    st.dataframe(data_rows, use_container_width=True)
+                else:
+                    st.info("No task-specific focus data available yet. Link tasks to your focus sessions to see analytics.")
+            
+            with analytics_tabs[2]:
+                st.markdown(f"""
+                <h4 style="color: {colors['primary_color']}; font-size: 1.4rem; font-weight: 600; margin: 1rem 0;">
+                Unlinked Sessions
+                </h4>
+                """, unsafe_allow_html=True)
+                
+                # Get unlinked focus stats
+                unlinked_stats = get_unlinked_focus_stats(st.session_state.user_id)
+                
+                if unlinked_stats:
+                    focus_minutes = unlinked_stats['unlinked_focus_time'] // 60
+                    focus_hours = focus_minutes // 60
+                    focus_remaining_minutes = focus_minutes % 60
+                    formatted_time = f"{focus_hours}h {focus_remaining_minutes}m" if focus_hours > 0 else f"{focus_minutes}m"
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.metric("Unlinked Focus Time", formatted_time)
+                    
+                    with col2:
+                        st.metric("Unlinked Sessions", unlinked_stats['unlinked_sessions'])
+                    
+                    # Calculate percentage of total time that is unlinked
+                    if st.session_state.total_focus_time > 0:
+                        unlinked_percentage = (unlinked_stats['unlinked_focus_time'] / st.session_state.total_focus_time) * 100
+                        
+                        st.markdown(f"""
+                        <div style="margin-top: 20px;">
+                            <p style="font-size: 1.1rem; color: {colors['text_color']};">
+                                <strong>{unlinked_percentage:.1f}%</strong> of your total focus time is not linked to specific tasks.
+                            </p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Add a suggestion based on the percentage
+                        if unlinked_percentage > 70:
+                            st.warning("Consider linking more of your focus sessions to specific tasks to better track your productivity.")
+                        elif unlinked_percentage < 30:
+                            st.success("Great job! Most of your focus time is linked to specific tasks, which helps track your productivity.")
+                else:
+                    st.info("No unlinked focus sessions data available.")
+    
+    # Move settings and Pomodoro info to the sidebar
+    with st.sidebar:
+        # Replace settings button with a collapsible expander
+        with st.expander("⚙️ Timer Settings", expanded=False):
+            # 5. Settings
+            st.markdown("### ⚙️ Timer Settings")
+            
+            # Check if we should reset to defaults
+            use_default_values = False
+            if 'reset_to_defaults' in st.session_state and st.session_state.reset_to_defaults:
+                use_default_values = True
+                # Clear the flag after we've detected it
+                st.session_state.reset_to_defaults = False
+            
+            # Pomodoro Duration
+            st.markdown(f"<p style='color: {colors['primary_color']}; font-weight: 600;'><strong>Pomodoro Duration (min)</strong></p>", unsafe_allow_html=True)
+            pomodoro_duration = st.slider(
+                "Pomodoro Duration",
+                min_value=1,
+                max_value=60,
+                value=25 if use_default_values else st.session_state.pomodoro_duration,
+                step=5,
+                disabled=st.session_state.timer_running and not st.session_state.timer_paused,
+                label_visibility="collapsed",
+                key="pomodoro_slider",
+                on_change=update_pomodoro_time
+            )
+            
+            # Short Break Duration
+            st.markdown(f"<p style='color: {colors['primary_color']}; font-weight: 600;'><strong>Short Break Duration (min)</strong></p>", unsafe_allow_html=True)
+            short_break_duration = st.slider(
+                "Short Break Duration",
+                min_value=1,
+                max_value=15,
+                value=5 if use_default_values else st.session_state.short_break_duration,
+                step=1,
+                disabled=st.session_state.timer_running and not st.session_state.timer_paused,
+                label_visibility="collapsed",
+                key="short_break_slider",
+                on_change=update_short_break_time
+            )
+            
+            # Long Break Duration
+            st.markdown(f"<p style='color: {colors['primary_color']}; font-weight: 600;'><strong>Long Break Duration (min)</strong></p>", unsafe_allow_html=True)
+            long_break_duration = st.slider(
+                "Long Break Duration",
+                min_value=2,
+                max_value=30,
+                value=15 if use_default_values else st.session_state.long_break_duration,
+                step=5,
+                disabled=st.session_state.timer_running and not st.session_state.timer_paused,
+                label_visibility="collapsed",
+                key="long_break_slider",
+                on_change=update_long_break_time
+            )
+            
+            # Check if settings have changed from their saved values
+            settings_changed = (
+                pomodoro_duration != st.session_state.pomodoro_duration or
+                short_break_duration != st.session_state.short_break_duration or
+                long_break_duration != st.session_state.long_break_duration or
+                st.session_state.settings_changed
+            )
+            
+            # Save button - only show if settings have changed
+            save_disabled = st.session_state.timer_running and not st.session_state.timer_paused
+            
+            # Create a container with controlled width
+            save_btn_col = st.container()
+            with save_btn_col:
+                col1, col2 = st.columns([2, 1])
+                
+                with col1:
+                    # Only show the save button if settings have changed or reset was clicked
+                    if settings_changed:
+                        save_btn = st.button("Save Settings", disabled=save_disabled, key="save_settings", type="primary", use_container_width=True)
+                        if save_btn:
+                            # Update session state with new values
+                            st.session_state.pomodoro_duration = pomodoro_duration
+                            st.session_state.short_break_duration = short_break_duration
+                            st.session_state.long_break_duration = long_break_duration
+                            
+                            # Save settings to database if user is logged in
+                            if hasattr(st.session_state, 'user_id') and st.session_state.user_id:
+                                update_timer_settings(
+                                    st.session_state.user_id,
+                                    pomodoro_duration, 
+                                    short_break_duration, 
+                                    long_break_duration
+                                )
+                            
+                            # Reset settings changed flag
+                            st.session_state.settings_changed = False
+                            
+                            # Update timer based on whether it's running
+                            if not st.session_state.timer_running:
+                                # Simply reset the timer mode
+                                set_timer_mode(st.session_state.timer_mode)
+                            else:
+                                # Timer is running, update time remaining based on new duration
+                                if st.session_state.timer_mode == 'pomodoro':
+                                    new_duration_seconds = pomodoro_duration * 60
+                                    elapsed_seconds = (st.session_state.pomodoro_duration * 60) - st.session_state.time_remaining
+                                    if elapsed_seconds < new_duration_seconds:
+                                        st.session_state.time_remaining = new_duration_seconds - elapsed_seconds
+                                        if st.session_state.target_end_time is not None:
+                                            st.session_state.target_end_time = time.time() + st.session_state.time_remaining
+                                elif st.session_state.timer_mode == 'short_break':
+                                    new_duration_seconds = short_break_duration * 60
+                                    elapsed_seconds = (st.session_state.short_break_duration * 60) - st.session_state.time_remaining
+                                    if elapsed_seconds < new_duration_seconds:
+                                        st.session_state.time_remaining = new_duration_seconds - elapsed_seconds
+                                        if st.session_state.target_end_time is not None:
+                                            st.session_state.target_end_time = time.time() + st.session_state.time_remaining
+                                else:  # long_break
+                                    new_duration_seconds = long_break_duration * 60
+                                    elapsed_seconds = (st.session_state.long_break_duration * 60) - st.session_state.time_remaining
+                                    if elapsed_seconds < new_duration_seconds:
+                                        st.session_state.time_remaining = new_duration_seconds - elapsed_seconds
+                                        if st.session_state.target_end_time is not None:
+                                            st.session_state.target_end_time = time.time() + st.session_state.time_remaining
+                            
+                            # Show success message and refresh the UI
+                            st.success("Settings saved!")
+                            st.rerun()  # Force a rerun to update the display
+                
+                with col2:
+                    # Add reset button to restore default values
+                    reset_btn = st.button("Reset", key="reset_settings", disabled=save_disabled, use_container_width=True)
+                    if reset_btn:
+                        # Default values
+                        default_pomodoro = 25
+                        default_short_break = 5
+                        default_long_break = 15
+                        
+                        # Update session state timer duration values
+                        st.session_state.pomodoro_duration = default_pomodoro
+                        st.session_state.short_break_duration = default_short_break
+                        st.session_state.long_break_duration = default_long_break
+                        
+                        # Don't try to directly modify slider values as this causes errors
+                        # Instead, store the values we want to use on the next render
+                        st.session_state.reset_to_defaults = True
+                        
+                        # Set flags to ensure save button appears
+                        st.session_state.settings_changed = True
+                        
+                        # Reset timer if it's not running
+                        if not st.session_state.timer_running:
+                            set_timer_mode(st.session_state.timer_mode)
+                        
+                        st.success("Settings reset to defaults! Click Save Settings to keep these defaults.")
+                        st.rerun()  # Force a rerun to update the display
+        
+        # Separator
+        st.markdown("<hr>", unsafe_allow_html=True)
+                
+        # Pomodoro Technique Info
+    with stylable_container(
+            key="pomodoro_info_sidebar",
+            css_styles=styles["card_container"],
+        ):
+            st.markdown("### 🍅 Pomodoro Technique")
+            
+            st.write("A time management method that breaks work into focused intervals separated by short breaks.")
+            
+            st.markdown("**Benefits:**")
+            
+            benefits = [
+                "Improves focus and concentration",
+                "Reduces mental fatigue",
+                "Increases productivity",
+                "Creates better work/break balance"
+            ]
+            
+            for benefit in benefits:
+                st.markdown(f"- {benefit}")
+    
+    # Timer logic - update time remaining if timer is running
+    if st.session_state.timer_running and not st.session_state.timer_paused:
+        current_time = time.time()
+        
+        if st.session_state.last_update_time:
+            # Calculate time remaining based on target end time
+            if st.session_state.target_end_time is not None:
+                st.session_state.time_remaining = max(0, int(st.session_state.target_end_time - current_time))
+            
+            # Update the last update time
+        st.session_state.last_update_time = current_time
+        
+        # Check if timer has finished
+        if st.session_state.time_remaining <= 0:
+            # Timer completed
+            if st.session_state.timer_mode == 'pomodoro':
+                # Log completed pomodoro
+                st.session_state.sessions_completed += 1
+                focus_time_seconds = st.session_state.pomodoro_duration * 60
+                st.session_state.total_focus_time += focus_time_seconds
+                
+                # Save stats if logged in
+                if hasattr(st.session_state, 'user_id') and st.session_state.user_id:
+                    # Update overall focus stats
+                    update_focus_stats(st.session_state.user_id, st.session_state.total_focus_time, st.session_state.sessions_completed)
+                    
+                    # If a task is linked, update task-specific focus stats
+                    if st.session_state.linked_task_id is not None:
+                        # We can use the task ID directly without lookup
+                        task_id = st.session_state.linked_task_id
+                        
+                        # Update task-specific focus stats (adding the current session)
+                        success = update_task_focus_stats(task_id, st.session_state.user_id, focus_time_seconds, 1)
+                        if success:
+                            task_name = st.session_state.linked_task
+                            st.toast(f"Focus time recorded for task: {task_name}", icon="📊")
+                            
+                            # Reset the linked task after successful completion
+                            st.session_state.linked_task = None
+                            st.session_state.linked_task_id = None
+                        elif st.session_state.linked_task:
+                            # Fallback to name lookup for backward compatibility
+                            task_id = get_task_id_by_name(st.session_state.user_id, st.session_state.linked_task)
+                            
+                            if task_id:
+                                # Update task-specific focus stats (adding the current session)
+                                success = update_task_focus_stats(task_id, st.session_state.user_id, focus_time_seconds, 1)
+                                if success:
+                                    task_name = st.session_state.linked_task
+                                    st.toast(f"Focus time recorded for task: {task_name}", icon="📊")
+                                    
+                                    # Reset the linked task after successful completion
+                                    st.session_state.linked_task = None
+                                    st.session_state.linked_task_id = None
+                                else:
+                                    st.error(f"Failed to update focus stats for task: {st.session_state.linked_task}")
+                            else:
+                                st.error(f"Could not find task ID for '{st.session_state.linked_task}'")
+                        else:
+                            # No task linked message (remove this line if not wanted)
+                            pass
+                    
+                # Show completion message
+                st.toast("Pomodoro complete! Great job! 🎉", icon="🎉")
+                
+                # Set awaiting_user_action flag
+                if "awaiting_user_action" not in st.session_state:
+                    st.session_state.awaiting_user_action = False
+                st.session_state.awaiting_user_action = True
+                
+                # Save current mode for transition
+                st.session_state.completed_mode = "pomodoro"
+                
+                # Reset timer
+                st.session_state.timer_running = False
+                st.session_state.target_end_time = None
+            else:
+                # Break completed
+                st.toast("Break time over! Ready to focus?", icon="⏱️")
+                
+                # Update break statistics
+                if st.session_state.timer_mode == 'short_break':
+                    break_time_seconds = st.session_state.short_break_duration * 60
+                else:  # long_break
+                    break_time_seconds = st.session_state.long_break_duration * 60
+                
+                # Update break counters
+                st.session_state.total_break_time += break_time_seconds
+                st.session_state.breaks_completed += 1
+                
+                # Set awaiting_user_action flag
+                if "awaiting_user_action" not in st.session_state:
+                    st.session_state.awaiting_user_action = False
+                st.session_state.awaiting_user_action = True
+                
+                # Save current mode for transition
+                st.session_state.completed_mode = "break"
+                
+                # Reset timer
+                st.session_state.timer_running = False
+                st.session_state.target_end_time = None
+        else:
+            # Timer still running
+            # Initialize last_update_time and target_end_time if not set
+            st.session_state.last_update_time = current_time
+            
+            # Calculate total duration
+            if st.session_state.timer_mode == 'pomodoro':
+                total_duration = st.session_state.pomodoro_duration * 60
+            elif st.session_state.timer_mode == 'short_break':
+                total_duration = st.session_state.short_break_duration * 60
+            else:  # long_break
+                total_duration = st.session_state.long_break_duration * 60
+            
+            st.session_state.target_end_time = current_time + st.session_state.time_remaining
+        
+        # Rerun to update the timer display
+        time.sleep(0.1)  # Small delay to reduce CPU usage
+        st.rerun()
+        
+    # Close the main container div
+    st.markdown('</div>', unsafe_allow_html=True)
